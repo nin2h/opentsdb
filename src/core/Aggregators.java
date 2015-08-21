@@ -47,6 +47,10 @@ public final class Aggregators {
   public static final Aggregator AVG = new Avg(
       Interpolation.LERP, "avg");
 
+  /** Aggregator that returns the angle average value of the data point. */
+  public static final Aggregator AVGANGLE = new AvgAngle(
+      Interpolation.LERP, "avgangle");
+
   /** Aggregator that returns the Standard Deviation of the data points. */
   public static final Aggregator DEV = new StdDev(
       Interpolation.LERP, "dev");
@@ -70,11 +74,12 @@ public final class Aggregators {
   private static final HashMap<String, Aggregator> aggregators;
 
   static {
-    aggregators = new HashMap<String, Aggregator>(8);
+    aggregators = new HashMap<String, Aggregator>(9);
     aggregators.put("sum", SUM);
     aggregators.put("min", MIN);
     aggregators.put("max", MAX);
     aggregators.put("avg", AVG);
+    aggregators.put("avgangle", AVGANGLE);
     aggregators.put("dev", DEV);
     aggregators.put("zimsum", ZIMSUM);
     aggregators.put("mimmin", MIMMIN);
@@ -260,6 +265,61 @@ public final class Aggregators {
       return method;
     }
    
+  }
+
+  /**
+   * Angle (degree) aggregator.
+   * This implementation is based upon a formula using
+   * <a href="https://en.wikipedia.org/wiki/Mean_of_circular_quantities">
+   * atan2</a> function
+   */
+  private static final class AvgAngle implements Aggregator {
+    private final Interpolation method;
+    private final String name;
+
+    public AvgAngle(final Interpolation method, final String name) {
+      this.method = method;
+      this.name = name;
+    }
+
+    public long runLong(final Longs values) {
+      double rad = Math.toRadians(values.nextLongValue());
+      double sin = Math.sin(rad);
+      double cos = Math.cos(rad);
+      int n = 1;
+      while (values.hasNextValue()) {
+        rad = Math.toRadians(values.nextLongValue());
+        sin += Math.sin(rad);
+        cos += Math.cos(rad);
+        n++;
+      }
+      final double deg = Math.toDegrees(Math.atan2(sin / n, cos / n));
+      return Math.round((deg + 360) % 360);
+    }
+
+    public double runDouble(final Doubles values) {
+      double rad = Math.toRadians(values.nextDoubleValue());
+      double sin = Math.sin(rad);
+      double cos = Math.cos(rad);
+      int n = 1;
+      while (values.hasNextValue()) {
+        rad = Math.toRadians(values.nextDoubleValue());
+        sin += Math.sin(rad);
+        cos += Math.cos(rad);
+        n++;
+      }
+      final double deg = Math.toDegrees(Math.atan2(sin / n, cos / n));
+      return (deg + 360) % 360;
+    }
+
+    public String toString() {
+      return name;
+    }
+
+    public Interpolation interpolationMethod() {
+      return method;
+    }
+
   }
 
   /**

@@ -19,8 +19,12 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
+import org.hbase.async.HBaseException;
+import org.hbase.async.RpcTimedOutException;
 import org.hbase.async.Bytes.ByteMap;
+import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.handler.codec.http.HttpMethod;
 import org.jboss.netty.handler.codec.http.HttpResponseStatus;
 import org.slf4j.Logger;
@@ -33,17 +37,20 @@ import com.stumbleupon.async.DeferredGroupException;
 import net.opentsdb.core.DataPoints;
 import net.opentsdb.core.IncomingDataPoint;
 import net.opentsdb.core.Query;
+import net.opentsdb.core.QueryException;
 import net.opentsdb.core.RateOptions;
 import net.opentsdb.core.TSDB;
 import net.opentsdb.core.TSQuery;
 import net.opentsdb.core.TSSubQuery;
 import net.opentsdb.core.Tags;
 import net.opentsdb.meta.Annotation;
-import net.opentsdb.meta.TSMeta;
 import net.opentsdb.meta.TSUIDQuery;
+import net.opentsdb.query.filter.TagVFilter;
+import net.opentsdb.stats.QueryStats;
+import net.opentsdb.stats.StatsCollector;
 import net.opentsdb.uid.NoSuchUniqueName;
 import net.opentsdb.uid.UniqueId;
-import net.opentsdb.utils.JSON;
+import net.opentsdb.utils.DateTime;
 
 /**
  * Handles queries for timeseries datapoints. Each request is parsed into a
@@ -59,6 +66,11 @@ import net.opentsdb.utils.JSON;
 final class QueryRpc implements HttpRpc {
   private static final Logger LOG = LoggerFactory.getLogger(QueryRpc.class);
   
+  /** Various counters and metrics for reporting query stats */
+  static final AtomicLong query_invalid = new AtomicLong();
+  static final AtomicLong query_exceptions = new AtomicLong();
+  static final AtomicLong query_success = new AtomicLong();
+  
   /**
    * Implements the /api/query endpoint to fetch data from OpenTSDB.
    * @param tsdb The TSDB to use for fetching data
@@ -68,11 +80,18 @@ final class QueryRpc implements HttpRpc {
   public void execute(final TSDB tsdb, final HttpQuery query) 
     throws IOException {
     
-    // only accept GET/POST
-    if (query.method() != HttpMethod.GET && query.method() != HttpMethod.POST) {
+    // only accept GET/POST/DELETE
+    if (query.method() != HttpMethod.GET && query.method() != HttpMethod.POST &&
+        query.method() != HttpMethod.DELETE) {
       throw new BadRequestException(HttpResponseStatus.METHOD_NOT_ALLOWED, 
           "Method not allowed", "The HTTP method [" + query.method().getName() +
           "] is not permitted for this endpoint");
+    }
+    if (query.method() == HttpMethod.DELETE && 
+        !tsdb.getConfig().getBoolean("tsd.http.query.allow_delete")) {
+      throw new BadRequestException(HttpResponseStatus.BAD_REQUEST,
+               "Bad request",
+               "Deleting data is not enabled (tsd.http.query.allow_delete=false)");
     }
     
     final String[] uri = query.explodeAPIPath();
@@ -91,6 +110,7 @@ final class QueryRpc implements HttpRpc {
    * @param query The HTTP query to parse/respond
    */
   private void handleQuery(final TSDB tsdb, final HttpQuery query) {
+    final long start = DateTime.currentTimeMillis();
     final TSQuery data_query;
     if (query.method() == HttpMethod.POST) {
       switch (query.apiVersion()) {
@@ -98,13 +118,19 @@ final class QueryRpc implements HttpRpc {
       case 1:
         data_query = query.serializer().parseQueryV1();
         break;
-      default: 
+      default:
+        query_invalid.incrementAndGet();
         throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
             "Requested API version not implemented", "Version " + 
             query.apiVersion() + " is not implemented");
       }
     } else {
-      data_query = this.parseQuery(tsdb, query);
+      data_query = parseQuery(tsdb, query);
+    }
+    
+    if (query.getAPIMethod() == HttpMethod.DELETE &&
+        tsdb.getConfig().getBoolean("tsd.http.query.allow_delete")) {
+      data_query.setDelete(true);
     }
     
     // validate and then compile the queries
@@ -116,70 +142,148 @@ final class QueryRpc implements HttpRpc {
           e.getMessage(), data_query.toString(), e);
     }
     
-    Query[] tsdbqueries;
-    try {
-      tsdbqueries = data_query.buildQueries(tsdb);
-    } catch(NoSuchUniqueName ex) {
-      throw new BadRequestException(ex);
-    }
-    final int nqueries = tsdbqueries.length;
-    final ArrayList<DataPoints[]> results = 
-      new ArrayList<DataPoints[]>(nqueries);
-    final ArrayList<Deferred<DataPoints[]>> deferreds =
-      new ArrayList<Deferred<DataPoints[]>>(nqueries);
-    for (int i = 0; i < nqueries; i++) {
-      deferreds.add(tsdbqueries[i].runAsync());
-    }
+    // if the user tried this query multiple times from the same IP and src port
+    // they'll be rejected on subsequent calls
+    final QueryStats query_stats = 
+        new QueryStats(query.getRemoteAddress(), data_query, 
+            query.getPrintableHeaders());
+    data_query.setQueryStats(query_stats);
+    query.setStats(query_stats);
+    
+    final int nqueries = data_query.getQueries().size();
+    final ArrayList<DataPoints[]> results = new ArrayList<DataPoints[]>(nqueries);
+    final List<Annotation> globals = new ArrayList<Annotation>();
+    
+    /** This has to be attached to callbacks or we may never respond to clients */
+    class ErrorCB implements Callback<Object, Exception> {
+      public Object call(final Exception e) throws Exception {
+        Throwable ex = e;
+        try {
+          LOG.error("Query exception: ", e);
+          if (ex instanceof DeferredGroupException) {
+            ex = e.getCause();
+            while (ex != null && ex instanceof DeferredGroupException) {
+              ex = ex.getCause();
+            }
+            if (ex == null) {
+              LOG.error("The deferred group exception didn't have a cause???");
+            }
+          } 
 
-    /**
-    * After all of the queries have run, we get the results in the order given
-    * and add dump the results in an array
-    */
-    class QueriesCB implements Callback<Object, ArrayList<DataPoints[]>> {
-      public Object call(final ArrayList<DataPoints[]> query_results) 
-        throws Exception {
-        results.addAll(query_results);
+          if (ex instanceof RpcTimedOutException) {
+            query_stats.markSerialized(HttpResponseStatus.REQUEST_TIMEOUT, ex);
+            query.badRequest(new BadRequestException(
+                HttpResponseStatus.REQUEST_TIMEOUT, ex.getMessage()));
+            query_exceptions.incrementAndGet();
+          } else if (ex instanceof HBaseException) {
+            query_stats.markSerialized(HttpResponseStatus.FAILED_DEPENDENCY, ex);
+            query.badRequest(new BadRequestException(
+                HttpResponseStatus.FAILED_DEPENDENCY, ex.getMessage()));
+            query_exceptions.incrementAndGet();
+          } else if (ex instanceof QueryException) {
+            query_stats.markSerialized(((QueryException)ex).getStatus(), ex);
+            query.badRequest(new BadRequestException(
+                ((QueryException)ex).getStatus(), ex.getMessage()));
+            query_exceptions.incrementAndGet();
+          } else if (ex instanceof BadRequestException) {
+            query_stats.markSerialized(((BadRequestException)ex).getStatus(), ex);
+            query.badRequest((BadRequestException)ex);
+            query_invalid.incrementAndGet();
+          } else if (ex instanceof NoSuchUniqueName) {
+            query_stats.markSerialized(HttpResponseStatus.BAD_REQUEST, ex);
+            query.badRequest(new BadRequestException(ex));
+            query_invalid.incrementAndGet();
+          } else {
+            query_stats.markSerialized(HttpResponseStatus.INTERNAL_SERVER_ERROR, ex);
+            query.badRequest(new BadRequestException(ex));
+            query_exceptions.incrementAndGet();
+          }
+          
+        } catch (RuntimeException ex2) {
+          LOG.error("Exception thrown during exception handling", ex2);
+          query_stats.markSerialized(HttpResponseStatus.INTERNAL_SERVER_ERROR, ex2);
+          query.sendReply(HttpResponseStatus.INTERNAL_SERVER_ERROR, 
+              ex2.getMessage().getBytes());
+          query_exceptions.incrementAndGet();
+        }
         return null;
       }
     }
     
-    // if the user wants global annotations, we need to scan and fetch
-    // TODO(cl) need to async this at some point. It's not super straight
-    // forward as we can't just add it to the "deferreds" queue since the types
-    // are different.
-    List<Annotation> globals = null;
-    if (!data_query.getNoAnnotations() && data_query.getGlobalAnnotations()) {
-      try {
-        globals = Annotation.getGlobalAnnotations(tsdb, 
-            data_query.startTime() / 1000, data_query.endTime() / 1000)
-            .joinUninterruptibly();
-      } catch (Exception e) {
-        throw new RuntimeException("Shouldn't be here", e);
+    /**
+     * After all of the queries have run, we get the results in the order given
+     * and add dump the results in an array
+     */
+    class QueriesCB implements Callback<Object, ArrayList<DataPoints[]>> {
+      public Object call(final ArrayList<DataPoints[]> query_results) 
+        throws Exception {
+        results.addAll(query_results);
+
+        /** Simply returns the buffer once serialization is complete and logs it */
+        class SendIt implements Callback<Object, ChannelBuffer> {
+          public Object call(final ChannelBuffer buffer) throws Exception {
+            query.sendReply(buffer);
+            query_success.incrementAndGet();
+            return null;
+          }
+        }
+
+        switch (query.apiVersion()) {
+        case 0:
+        case 1:
+            query.serializer().formatQueryAsyncV1(data_query, results, 
+               globals).addCallback(new SendIt()).addErrback(new ErrorCB());
+          break;
+        default: 
+          query_invalid.incrementAndGet();
+          throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+              "Requested API version not implemented", "Version " + 
+              query.apiVersion() + " is not implemented");
+        }
+        return null;
       }
     }
-
-    try {
-      Deferred.groupInOrder(deferreds).addCallback(new QueriesCB())
-        .joinUninterruptibly();
-    } catch (Exception e) {
-      throw new RuntimeException("Shouldn't be here", e);
+    
+    /**
+     * Callback executed after we have resolved the metric, tag names and tag
+     * values to their respective UIDs. This callback then runs the actual 
+     * queries and fetches their results.
+     */
+    class BuildCB implements Callback<Deferred<Object>, Query[]> {
+      @Override
+      public Deferred<Object> call(final Query[] queries) {
+        final ArrayList<Deferred<DataPoints[]>> deferreds = 
+            new ArrayList<Deferred<DataPoints[]>>(queries.length);
+        for (final Query query : queries) {
+          deferreds.add(query.runAsync());
+        }
+        return Deferred.groupInOrder(deferreds).addCallback(new QueriesCB());
+      }
     }
     
-    switch (query.apiVersion()) {
-    case 0:
-    case 1:
-      query.sendReply(query.serializer().formatQueryV1(data_query, results, 
-          globals));
-      break;
-    default: 
-      throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
-          "Requested API version not implemented", "Version " + 
-          query.apiVersion() + " is not implemented");
+    /** Handles storing the global annotations after fetching them */
+    class GlobalCB implements Callback<Object, List<Annotation>> {
+      public Object call(final List<Annotation> annotations) throws Exception {
+        globals.addAll(annotations);
+        return data_query.buildQueriesAsync(tsdb).addCallback(new BuildCB());
+      }
+    }
+ 
+    // if we the caller wants to search for global annotations, fire that off 
+    // first then scan for the notes, then pass everything off to the formatter
+    // when complete
+    if (!data_query.getNoAnnotations() && data_query.getGlobalAnnotations()) {
+      Annotation.getGlobalAnnotations(tsdb, 
+        data_query.startTime() / 1000, data_query.endTime() / 1000)
+          .addCallback(new GlobalCB()).addErrback(new ErrorCB());
+    } else {
+      data_query.buildQueriesAsync(tsdb).addCallback(new BuildCB())
+        .addErrback(new ErrorCB());
     }
   }
   
   /**
-   * 
+   * Processes a last data point query
    * @param tsdb The TSDB to which we belong
    * @param query The HTTP query to parse/respond
    */
@@ -206,12 +310,10 @@ final class QueryRpc implements HttpRpc {
           "Missing sub queries");
     }
     
-    // list of getLastPoint calls
-    final ArrayList<Deferred<IncomingDataPoint>> calls = 
-      new ArrayList<Deferred<IncomingDataPoint>>();
-    // list of calls to TSUIDQuery for scanning the tsdb-meta table
-    final ArrayList<Deferred<Object>> tsuid_query_wait = 
-      new ArrayList<Deferred<Object>>();
+    // a list of deferreds to wait on
+    final ArrayList<Deferred<Object>> calls = new ArrayList<Deferred<Object>>();
+    // final results for serialization
+    final List<IncomingDataPoint> results = new ArrayList<IncomingDataPoint>();
     
     /**
      * Used to catch exceptions 
@@ -231,7 +333,29 @@ final class QueryRpc implements HttpRpc {
         } else {
           throw e;
         }
-      }  
+      }
+      @Override
+      public String toString() {
+        return "Error back";
+      }
+    }
+    
+    final class FetchCB implements Callback<Deferred<Object>, ArrayList<IncomingDataPoint>> {
+      @Override
+      public Deferred<Object> call(final ArrayList<IncomingDataPoint> dps) throws Exception {
+        synchronized(results) {
+          for (final IncomingDataPoint dp : dps) {
+            if (dp != null) {
+              results.add(dp);
+            }
+          }
+        }
+        return Deferred.fromResult(null);
+      }
+      @Override
+      public String toString() {
+        return "Fetched data points CB";
+      }
     }
     
     /**
@@ -239,78 +363,75 @@ final class QueryRpc implements HttpRpc {
      * metric and/or tags. If matches were found, it fires off a number of
      * getLastPoint requests, adding the deferreds to the calls list
      */
-    final class TSUIDQueryCB implements Callback<Object, ByteMap<Long>> {
-      public Object call(final ByteMap<Long> tsuids) throws Exception {
+    final class TSUIDQueryCB implements Callback<Deferred<Object>, ByteMap<Long>> {
+      public Deferred<Object> call(final ByteMap<Long> tsuids) throws Exception {
         if (tsuids == null || tsuids.isEmpty()) {
           return null;
         }
-        
+        final ArrayList<Deferred<IncomingDataPoint>> deferreds =
+            new ArrayList<Deferred<IncomingDataPoint>>(tsuids.size());
         for (Map.Entry<byte[], Long> entry : tsuids.entrySet()) {
-          calls.add(TSUIDQuery.getLastPoint(tsdb, entry.getKey(), 
+          deferreds.add(TSUIDQuery.getLastPoint(tsdb, entry.getKey(), 
               data_query.getResolveNames(), data_query.getBackScan(), 
               entry.getValue()));
         }
-        return null;
+        return Deferred.group(deferreds).addCallbackDeferring(new FetchCB());
+      }
+      @Override
+      public String toString() {
+        return "TSMeta scan CB";
       }
     }
-    
-    /**
-     * Callback used to force the thread to wait for the TSUIDQueries to complete
-     */
-    final class TSUIDQueryWaitCB implements Callback<Object, ArrayList<Object>> {
-      public Object call(ArrayList<Object> arg0) throws Exception {
-        return null;
-      }
-    }
-    
+
     /**
      * Used to wait on the list of data point deferreds. Once they're all done
      * this will return the results to the call via the serializer
      */
-    final class FinalCB implements Callback<Object, ArrayList<IncomingDataPoint>> {
-      @SuppressWarnings("unchecked")
-      public Object call(final ArrayList<IncomingDataPoint> data_points) 
-        throws Exception {
-        if (data_points == null) {
-          query.sendReply(query.serializer()
-              .formatLastPointQueryV1(Collections.EMPTY_LIST));
-        } else {
-          query.sendReply(query.serializer()
-              .formatLastPointQueryV1(data_points));
-        }
+    final class FinalCB implements Callback<Object, ArrayList<Object>> {
+      public Object call(final ArrayList<Object> done) throws Exception {
+        query.sendReply(query.serializer().formatLastPointQueryV1(results));
         return null;
       }
+      @Override
+      public String toString() {
+        return "Final CB";
+      }
     }
+    
     try {   
       // start executing the queries
-      for (LastPointSubQuery sub_query : data_query.getQueries()) {
+      for (final LastPointSubQuery sub_query : data_query.getQueries()) {
+        final ArrayList<Deferred<IncomingDataPoint>> deferreds =
+            new ArrayList<Deferred<IncomingDataPoint>>();
         // TSUID queries take precedence so if there are any TSUIDs listed, 
         // process the TSUIDs and ignore the metric/tags
         if (sub_query.getTSUIDs() != null && !sub_query.getTSUIDs().isEmpty()) {
-          for (String tsuid : sub_query.getTSUIDs()) {
-            calls.add(TSUIDQuery.getLastPoint(tsdb, UniqueId.stringToUid(tsuid), 
-                data_query.getResolveNames(), data_query.getBackScan(), 0));
+          for (final String tsuid : sub_query.getTSUIDs()) {
+            final TSUIDQuery tsuid_query = new TSUIDQuery(tsdb, 
+                UniqueId.stringToUid(tsuid));
+            deferreds.add(tsuid_query.getLastPoint(data_query.getResolveNames(), 
+                data_query.getBackScan()));
           }
         } else {
-          final TSUIDQuery tsuid_query = new TSUIDQuery(tsdb);
           @SuppressWarnings("unchecked")
-          final HashMap<String, String> tags = 
-            (HashMap<String, String>) (sub_query.getTags() != null ? 
-              sub_query.getTags() : Collections.EMPTY_MAP);
-          tsuid_query.setQuery(sub_query.getMetric(), tags);
-          tsuid_query_wait.add(
-              tsuid_query.getLastWriteTimes().addCallback(new TSUIDQueryCB()));
+          final TSUIDQuery tsuid_query = 
+              new TSUIDQuery(tsdb, sub_query.getMetric(), 
+                  sub_query.getTags() != null ? 
+                      sub_query.getTags() : Collections.EMPTY_MAP);
+          if (data_query.getBackScan() > 0) {
+            deferreds.add(tsuid_query.getLastPoint(data_query.getResolveNames(), 
+                data_query.getBackScan()));
+          } else {
+            calls.add(tsuid_query.getLastWriteTimes()
+                .addCallbackDeferring(new TSUIDQueryCB()));
+          }
+        }
+        
+        if (deferreds.size() > 0) {
+          calls.add(Deferred.group(deferreds).addCallbackDeferring(new FetchCB()));
         }
       }
       
-      if (!tsuid_query_wait.isEmpty()) {
-        // wait on the time series queries first. If you don't, they may try
-        // to add deferreds to the calls list
-        Deferred.group(tsuid_query_wait)
-          .addCallback(new TSUIDQueryWaitCB())
-          .addErrback(new ErrBack())
-          .joinUninterruptibly();
-      }
       Deferred.group(calls)
         .addCallback(new FinalCB())
         .addErrback(new ErrBack())
@@ -340,7 +461,7 @@ final class QueryRpc implements HttpRpc {
    * @return A TSQuery if parsing was successful
    * @throws BadRequestException if parsing was unsuccessful
    */
-  private TSQuery parseQuery(final TSDB tsdb, final HttpQuery query) {
+  public static TSQuery parseQuery(final TSDB tsdb, final HttpQuery query) {
     final TSQuery data_query = new TSQuery();
     
     data_query.setStart(query.getRequiredQueryStringParam("start"));
@@ -366,18 +487,30 @@ final class QueryRpc implements HttpRpc {
       data_query.setMsResolution(true);
     }
     
+    if (query.hasQueryStringParam("show_query")) {
+      data_query.setShowQuery(true);
+    }  
+    
+    if (query.hasQueryStringParam("show_stats")) {
+      data_query.setShowStats(true);
+    }    
+    
+    if (query.hasQueryStringParam("show_summary")) {
+        data_query.setShowSummary(true);
+    }
+    
     // handle tsuid queries first
     if (query.hasQueryStringParam("tsuid")) {
       final List<String> tsuids = query.getQueryStringParams("tsuid");     
       for (String q : tsuids) {
-        this.parseTsuidTypeSubQuery(q, data_query);
+        parseTsuidTypeSubQuery(q, data_query);
       }
     }
     
     if (query.hasQueryStringParam("m")) {
       final List<String> legacy_queries = query.getQueryStringParams("m");      
       for (String q : legacy_queries) {
-        this.parseMTypeSubQuery(q, data_query);
+        parseMTypeSubQuery(q, data_query);
       }
     }
     
@@ -396,7 +529,7 @@ final class QueryRpc implements HttpRpc {
    * @throws BadRequestException if we are unable to parse the query or it is
    * missing components
    */
-  private void parseMTypeSubQuery(final String query_string, 
+  private static void parseMTypeSubQuery(final String query_string, 
       TSQuery data_query) {
     if (query_string == null || query_string.isEmpty()) {
       throw new BadRequestException("The query string was empty");
@@ -417,9 +550,9 @@ final class QueryRpc implements HttpRpc {
     sub_query.setAggregator(parts[0]);
     
     i--; // Move to the last part (the metric name).
-    HashMap<String, String> tags = new HashMap<String, String>();
-    sub_query.setMetric(Tags.parseWithMetric(parts[i], tags));
-    sub_query.setTags(tags);
+    List<TagVFilter> filters = new ArrayList<TagVFilter>();
+    sub_query.setMetric(Tags.parseWithMetricAndFilters(parts[i], filters));
+    sub_query.setFilters(filters);
     
     // parse out the rate and downsampler 
     for (int x = 1; x < parts.length - 1; x++) {
@@ -449,7 +582,7 @@ final class QueryRpc implements HttpRpc {
    * @throws BadRequestException if we are unable to parse the query or it is
    * missing components
    */
-  private void parseTsuidTypeSubQuery(final String query_string, 
+  private static void parseTsuidTypeSubQuery(final String query_string, 
       TSQuery data_query) {
     if (query_string == null || query_string.isEmpty()) {
       throw new BadRequestException("The tsuid query string was empty");
@@ -527,14 +660,15 @@ final class QueryRpc implements HttpRpc {
                + parts.length + " parts");
      }
 
-     final boolean counter = "counter".equals(parts[0]);
+     final boolean counter = parts[0].endsWith("counter");
      try {
        final long max = (parts.length >= 2 && parts[1].length() > 0 ? Long
            .parseLong(parts[1]) : Long.MAX_VALUE);
        try {
          final long reset = (parts.length >= 3 && parts[2].length() > 0 ? Long
              .parseLong(parts[2]) : RateOptions.DEFAULT_RESET_VALUE);
-         return new RateOptions(counter, max, reset);
+         final boolean drop_counter = parts[0].equals("dropcounter");
+         return new RateOptions(counter, max, reset, drop_counter);
        } catch (NumberFormatException e) {
          throw new BadRequestException(
              "Reset value of counter was not a number, received '" + parts[2]
@@ -591,6 +725,13 @@ final class QueryRpc implements HttpRpc {
     
     query.setQueries(sub_queries);
     return query;
+  }
+  
+  /** @param collector Populates the collector with statistics */
+  public static void collectStats(final StatsCollector collector) {
+    collector.record("http.query.invalid_requests", query_invalid);
+    collector.record("http.query.exceptions", query_exceptions);
+    collector.record("http.query.success", query_success);
   }
   
   public static class LastPointQuery {

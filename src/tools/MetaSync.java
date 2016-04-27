@@ -12,7 +12,6 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.tools;
 
-import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -28,7 +27,6 @@ import net.opentsdb.uid.UniqueId;
 import net.opentsdb.uid.UniqueId.UniqueIdType;
 
 import org.hbase.async.Bytes;
-import org.hbase.async.HBaseException;
 import org.hbase.async.KeyValue;
 import org.hbase.async.Scanner;
 import org.slf4j.Logger;
@@ -54,13 +52,7 @@ final class MetaSync extends Thread {
   
   /** TSDB to use for storage access */
   final TSDB tsdb;
-  
-  /** The ID to start the sync with for this thread */
-  final long start_id;
-  
-  /** The end of the ID block to work on */
-  final long end_id;
-  
+
   /** A shared list of TSUIDs that have been processed by this or other 
    * threads. It stores hashes instead of the bytes or strings to save
    * on space */
@@ -78,22 +70,27 @@ final class MetaSync extends Thread {
   /** Diagnostic ID for this thread */
   final int thread_id;
   
+  /** The scanner for this worker */
+  final Scanner scanner;
+  
   /**
    * Constructor that sets local variables
    * @param tsdb The TSDB to process with
-   * @param start_id The starting ID of the block we'll work on
-   * @param quotient The total number of IDs in our block
+   * @param scanner The scanner to use for this worker
+   * @param processed_tsuids TSUIDs that have been processed already
+   * @param metric_uids List of metric UIDs
+   * @param tagk_uids List of tag key UIDs
+   * @param tagv_uids List of tag value UIDs
    * @param thread_id The ID of this thread (starts at 0)
    */
-  public MetaSync(final TSDB tsdb, final long start_id, final double quotient, 
+  public MetaSync(final TSDB tsdb, final Scanner scanner, 
       final Set<Integer> processed_tsuids,
       ConcurrentHashMap<String, Long> metric_uids,
       ConcurrentHashMap<String, Long> tagk_uids,
       ConcurrentHashMap<String, Long> tagv_uids,
       final int thread_id) {
     this.tsdb = tsdb;
-    this.start_id = start_id;
-    this.end_id = start_id + (long) quotient + 1; // teensy bit of overlap
+    this.scanner = scanner;
     this.processed_tsuids = processed_tsuids;
     this.metric_uids = metric_uids;
     this.tagk_uids = tagk_uids;
@@ -105,11 +102,28 @@ final class MetaSync extends Thread {
    * Loops through the entire TSDB data set and exits when complete.
    */
   public void run() {
-    
     // list of deferred calls used to act as a buffer
     final ArrayList<Deferred<Boolean>> storage_calls = 
       new ArrayList<Deferred<Boolean>>();
     final Deferred<Object> result = new Deferred<Object>();
+
+    final class ErrBack implements Callback<Object, Exception> {
+      @Override
+      public Object call(Exception e) throws Exception {
+        Throwable ex = e;
+        while (ex.getClass().equals(DeferredGroupException.class)) {
+          if (ex.getCause() == null) {
+            LOG.warn("Unable to get to the root cause of the DGE");
+            break;
+          }
+          ex = ex.getCause();
+        }
+        LOG.error("Sync thread failed with exception", ex);
+        result.callback(null);
+        return null;
+      }
+    }
+    final ErrBack err_back = new ErrBack();
     
     /**
      * Called when we have encountered a previously un-processed UIDMeta object.
@@ -342,17 +356,9 @@ final class MetaSync extends Thread {
     final class MetaScanner implements Callback<Object, 
       ArrayList<ArrayList<KeyValue>>> {
       
-      private final Scanner scanner;
       private byte[] last_tsuid = null;
       private String tsuid_string = "";
-      
-      /**
-       * Default constructor that initializes the data row scanner
-       */
-      public MetaScanner() {
-        scanner = getScanner();
-      }
-      
+
       /**
        * Fetches the next set of rows from the scanner and adds this class as
        * a callback
@@ -360,7 +366,7 @@ final class MetaSync extends Thread {
        * been processed.
        */
       public Object scan() {
-        return scanner.nextRows().addCallback(this);
+        return scanner.nextRows().addCallback(this).addErrback(err_back);
       }
 
       @Override
@@ -372,132 +378,136 @@ final class MetaSync extends Thread {
         }
         
         for (final ArrayList<KeyValue> row : rows) {
-
-          final byte[] tsuid = UniqueId.getTSUIDFromKey(row.get(0).key(), 
-              TSDB.metrics_width(), Const.TIMESTAMP_BYTES);
-          
-          // if the current tsuid is the same as the last, just continue
-          // so we save time
-          if (last_tsuid != null && Arrays.equals(last_tsuid, tsuid)) {
-            continue;
-          }
-          last_tsuid = tsuid;
-          
-          // see if we've already processed this tsuid and if so, continue
-          if (processed_tsuids.contains(Arrays.hashCode(tsuid))) {
-            continue;
-          }
-          tsuid_string = UniqueId.uidToString(tsuid);
-          
-          // add tsuid to the processed list
-          processed_tsuids.add(Arrays.hashCode(tsuid));
-          
-          // we may have a new TSUID or UIDs, so fetch the timestamp of the 
-          // row for use as the "created" time. Depending on speed we could 
-          // parse datapoints, but for now the hourly row time is enough
-          final long timestamp = Bytes.getUnsignedInt(row.get(0).key(), 
-              TSDB.metrics_width());
-          
-          LOG.debug("[" + thread_id + "] Processing TSUID: " + tsuid_string + 
-              "  row timestamp: " + timestamp);
-          
-          // now process the UID metric meta data
-          final byte[] metric_uid_bytes = 
-            Arrays.copyOfRange(tsuid, 0, TSDB.metrics_width()); 
-          final String metric_uid = UniqueId.uidToString(metric_uid_bytes);
-          Long last_get = metric_uids.get(metric_uid);
-          
-          if (last_get == null || last_get == 0 || timestamp < last_get) {
-            // fetch and update. Returns default object if the meta doesn't
-            // exist, so we can just call sync on this to create a missing
-            // entry
-            final UidCB cb = new UidCB(UniqueIdType.METRIC, 
-                metric_uid_bytes, timestamp);
-            final Deferred<Boolean> process_uid = UIDMeta.getUIDMeta(tsdb, 
-                UniqueIdType.METRIC, metric_uid_bytes).addCallbackDeferring(cb);
-            storage_calls.add(process_uid);
-            metric_uids.put(metric_uid, timestamp);
-          }
-          
-          // loop through the tags and process their meta
-          final List<byte[]> tags = UniqueId.getTagsFromTSUID(tsuid_string);
-          int idx = 0;
-          for (byte[] tag : tags) {
-            final UniqueIdType type = (idx % 2 == 0) ? UniqueIdType.TAGK : 
-              UniqueIdType.TAGV;
-            idx++;
-            final String uid = UniqueId.uidToString(tag);
+          try {
+            final byte[] tsuid = UniqueId.getTSUIDFromKey(row.get(0).key(), 
+                TSDB.metrics_width(), Const.TIMESTAMP_BYTES);
             
-            // check the maps to see if we need to bother updating
-            if (type == UniqueIdType.TAGK) {
-              last_get = tagk_uids.get(uid);
-            } else {
-              last_get = tagv_uids.get(uid);
-            }
-            if (last_get != null && last_get != 0 && last_get <= timestamp) {
+            // if the current tsuid is the same as the last, just continue
+            // so we save time
+            if (last_tsuid != null && Arrays.equals(last_tsuid, tsuid)) {
               continue;
             }
-
-            // fetch and update. Returns default object if the meta doesn't
-            // exist, so we can just call sync on this to create a missing
-            // entry
-            final UidCB cb = new UidCB(type, tag, timestamp);
-            final Deferred<Boolean> process_uid = UIDMeta.getUIDMeta(tsdb, type, tag)
-              .addCallbackDeferring(cb);
-            storage_calls.add(process_uid);
-            if (type == UniqueIdType.TAGK) {
-              tagk_uids.put(uid, timestamp);
-            } else {
-              tagv_uids.put(uid, timestamp);
-            }
-          }
-          
-          /**
-           * An error callback used to cache issues with a particular timeseries
-           * or UIDMeta such as a missing UID name. We want to continue
-           * processing when this happens so we'll just log the error and
-           * the user can issue a command later to clean up orphaned meta
-           * entries.
-           */
-          final class ErrBack implements Callback<Deferred<Boolean>, Exception> {
+            last_tsuid = tsuid;
             
-            @Override
-            public Deferred<Boolean> call(Exception e) throws Exception {
-              
-              Throwable ex = e;
-              while (ex.getClass().equals(DeferredGroupException.class)) {
-                if (ex.getCause() == null) {
-                  LOG.warn("Unable to get to the root cause of the DGE");
-                  break;
+            // see if we've already processed this tsuid and if so, continue
+            if (processed_tsuids.contains(Arrays.hashCode(tsuid))) {
+              continue;
+            }
+            tsuid_string = UniqueId.uidToString(tsuid);
+            
+            /**
+             * An error callback used to catch issues with a particular timeseries
+             * or UIDMeta such as a missing UID name. We want to continue
+             * processing when this happens so we'll just log the error and
+             * the user can issue a command later to clean up orphaned meta
+             * entries.
+             */
+            final class RowErrBack implements Callback<Object, Exception> {
+              @Override
+              public Object call(Exception e) throws Exception {
+                Throwable ex = e;
+                while (ex.getClass().equals(DeferredGroupException.class)) {
+                  if (ex.getCause() == null) {
+                    LOG.warn("Unable to get to the root cause of the DGE");
+                    break;
+                  }
+                  ex = ex.getCause();
                 }
-                ex = ex.getCause();
+                if (ex.getClass().equals(IllegalStateException.class)) {
+                  LOG.error("Invalid data when processing TSUID [" + 
+                      tsuid_string + "]: " + ex.getMessage());
+                } else if (ex.getClass().equals(IllegalArgumentException.class)) {
+                  LOG.error("Invalid data when processing TSUID [" + 
+                      tsuid_string + "]: " + ex.getMessage());
+                } else if (ex.getClass().equals(NoSuchUniqueId.class)) {
+                  LOG.warn("Timeseries [" + tsuid_string + 
+                      "] includes a non-existant UID: " + ex.getMessage());
+                } else {
+                  LOG.error("Unknown exception processing row: " + row, ex);
+                }
+                return null;
               }
-              if (ex.getClass().equals(IllegalStateException.class)) {
-                LOG.error("Invalid data when processing TSUID [" + 
-                    tsuid_string + "]", ex);
-              } else if (ex.getClass().equals(IllegalArgumentException.class)) {
-                LOG.error("Invalid data when processing TSUID [" + 
-                    tsuid_string + "]", ex);
-              } else if (ex.getClass().equals(NoSuchUniqueId.class)) {
-                LOG.warn("Timeseries [" + tsuid_string + 
-                    "] includes a non-existant UID: " + ex.getMessage());
-              } else {
-                LOG.error("Unmatched Exception: " + ex.getClass());
-                throw e;
-              }
-              
-              return Deferred.fromResult(false);
             }
             
+            // add tsuid to the processed list
+            processed_tsuids.add(Arrays.hashCode(tsuid));
+            
+            // we may have a new TSUID or UIDs, so fetch the timestamp of the 
+            // row for use as the "created" time. Depending on speed we could 
+            // parse datapoints, but for now the hourly row time is enough
+            final long timestamp = Bytes.getUnsignedInt(row.get(0).key(), 
+                Const.SALT_WIDTH() + TSDB.metrics_width());
+            
+            LOG.debug("[" + thread_id + "] Processing TSUID: " + tsuid_string + 
+                "  row timestamp: " + timestamp);
+            
+            // now process the UID metric meta data
+            final byte[] metric_uid_bytes = 
+              Arrays.copyOfRange(tsuid, 0, TSDB.metrics_width());
+            final String metric_uid = UniqueId.uidToString(metric_uid_bytes);
+            Long last_get = metric_uids.get(metric_uid);
+            
+            if (last_get == null || last_get == 0 || timestamp < last_get) {
+              // fetch and update. Returns default object if the meta doesn't
+              // exist, so we can just call sync on this to create a missing
+              // entry
+              final UidCB cb = new UidCB(UniqueIdType.METRIC, 
+                  metric_uid_bytes, timestamp);
+              final Deferred<Boolean> process_uid = UIDMeta.getUIDMeta(tsdb, 
+                  UniqueIdType.METRIC, metric_uid_bytes)
+                  .addCallbackDeferring(cb)
+                  .addErrback(new RowErrBack());
+              storage_calls.add(process_uid);
+              metric_uids.put(metric_uid, timestamp);
+            }
+            
+            // loop through the tags and process their meta
+            final List<byte[]> tags = UniqueId.getTagsFromTSUID(tsuid_string);
+            int idx = 0;
+            for (byte[] tag : tags) {
+              final UniqueIdType type = (idx % 2 == 0) ? UniqueIdType.TAGK : 
+                UniqueIdType.TAGV;
+              idx++;
+              final String uid = UniqueId.uidToString(tag);
+              
+              // check the maps to see if we need to bother updating
+              if (type == UniqueIdType.TAGK) {
+                last_get = tagk_uids.get(uid);
+              } else {
+                last_get = tagv_uids.get(uid);
+              }
+              if (last_get != null && last_get != 0 && last_get <= timestamp) {
+                continue;
+              }
+  
+              // fetch and update. Returns default object if the meta doesn't
+              // exist, so we can just call sync on this to create a missing
+              // entry
+              final UidCB cb = new UidCB(type, tag, timestamp);
+              final Deferred<Boolean> process_uid = 
+                  UIDMeta.getUIDMeta(tsdb, type, tag)
+                  .addCallbackDeferring(cb)
+                  .addErrback(new RowErrBack());
+              storage_calls.add(process_uid);
+              if (type == UniqueIdType.TAGK) {
+                tagk_uids.put(uid, timestamp);
+              } else {
+                tagv_uids.put(uid, timestamp);
+              }
+            }
+            
+            // handle the timeseries meta last so we don't record it if one
+            // or more of the UIDs had an issue
+            final Deferred<Boolean> process_tsmeta = 
+              TSMeta.getTSMeta(tsdb, tsuid_string)
+                .addCallbackDeferring(new TSMetaCB(tsuid, timestamp))
+                .addErrback(new RowErrBack());
+            storage_calls.add(process_tsmeta);
+          } catch (RuntimeException e) {
+            LOG.error("Processing row " + row + " failed with exception: " 
+                + e.getMessage());
+            LOG.debug("Row: " + row + " stack trace: ", e);
           }
-          
-          // handle the timeseries meta last so we don't record it if one
-          // or more of the UIDs had an issue
-          final Deferred<Boolean> process_tsmeta = 
-            TSMeta.getTSMeta(tsdb, tsuid_string)
-              .addCallbackDeferring(new TSMetaCB(tsuid, timestamp));
-          process_tsmeta.addErrback(new ErrBack());
-          storage_calls.add(process_tsmeta);
         }
         
         /**
@@ -557,27 +567,6 @@ final class MetaSync extends Thread {
       LOG.error("[" + thread_id + "] Scanner Exception", e);
       throw new RuntimeException("[" + thread_id + "] Scanner exception", e);
     }
-  }
-  
-  /**
-   * Returns a scanner set to scan the range configured for this thread
-   * @return A scanner on the "t" CF configured for the specified range
-   * @throws HBaseException if something goes boom
-   */
-  private Scanner getScanner() throws HBaseException {
-    final short metric_width = TSDB.metrics_width();
-    final byte[] start_row = 
-      Arrays.copyOfRange(Bytes.fromLong(start_id), 8 - metric_width, 8);
-    final byte[] end_row = 
-      Arrays.copyOfRange(Bytes.fromLong(end_id), 8 - metric_width, 8);
-
-    LOG.debug("[" + thread_id + "] Start row: " + UniqueId.uidToString(start_row));
-    LOG.debug("[" + thread_id + "] End row: " + UniqueId.uidToString(end_row));
-    final Scanner scanner = tsdb.getClient().newScanner(tsdb.dataTable());
-    scanner.setStartKey(start_row);
-    scanner.setStopKey(end_row);
-    scanner.setFamily("t".getBytes(Charset.forName("ISO-8859-1")));
-    return scanner;
   }
 
 }
